@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Model checkpoints and outputs
+checkpoints/
+output/
+logs/
+*.pth
+*.pth.tar
+*.ckpt
+
+# TensorBoard
+*.tfevents.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files (uncomment if you don't want to track datasets)
+# *.jpg
+# *.png
+# *.jpeg
+# data/
+
