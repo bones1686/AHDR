@@ -105,7 +105,8 @@ def train_epoch(
     """
     model.train()
     
-    metrics = MetricTracker(['loss', 'l1', 'perceptual', 'psnr'])
+    # Track all loss components for realistic textures configuration
+    metrics = MetricTracker(['loss', 'l1', 'perceptual', 'ssim', 'edge', 'frequency', 'psnr'])
     
     pbar = tqdm(dataloader, desc="Training", leave=False)
     
@@ -129,12 +130,15 @@ def train_epoch(
         with torch.no_grad():
             psnr = calculate_psnr(outputs, targets)
         
-        # Update metrics
+        # Update metrics with all loss components
         batch_size = inputs.size(0)
         metrics.update({
             'loss': loss_components['total'],
             'l1': loss_components.get('l1', 0),
             'perceptual': loss_components.get('perceptual', 0),
+            'ssim': loss_components.get('ssim', 0),
+            'edge': loss_components.get('edge', 0),
+            'frequency': loss_components.get('frequency', 0),
             'psnr': psnr
         }, batch_size)
         
@@ -162,7 +166,8 @@ def validate(
     """
     model.eval()
     
-    metrics = MetricTracker(['loss', 'l1', 'perceptual', 'psnr'])
+    # Track all loss components for realistic textures configuration
+    metrics = MetricTracker(['loss', 'l1', 'perceptual', 'ssim', 'edge', 'frequency', 'psnr'])
     
     with torch.no_grad():
         for inputs, targets in tqdm(dataloader, desc="Validating", leave=False):
@@ -174,11 +179,15 @@ def validate(
             
             psnr = calculate_psnr(outputs, targets)
             
+            # Update metrics with all loss components
             batch_size = inputs.size(0)
             metrics.update({
                 'loss': loss_components['total'],
                 'l1': loss_components.get('l1', 0),
                 'perceptual': loss_components.get('perceptual', 0),
+                'ssim': loss_components.get('ssim', 0),
+                'edge': loss_components.get('edge', 0),
+                'frequency': loss_components.get('frequency', 0),
                 'psnr': psnr
             }, batch_size)
     
@@ -257,11 +266,13 @@ def main():
     params = count_parameters(model)
     print(f"Model parameters: {params['total']:,} ({params['trainable']:,} trainable)")
     
-    # Create loss function
+    # Create loss function - Realistic Textures Configuration
     criterion = CombinedLoss(
         l1_weight=config.l1_weight,
         perceptual_weight=config.perceptual_weight,
         ssim_weight=config.ssim_weight,
+        edge_weight=config.edge_weight,
+        frequency_weight=config.frequency_weight,
         use_charbonnier=True
     ).to(device)
     

@@ -1,10 +1,13 @@
 """
-Loss Functions for HDR Training
+Loss Functions for HDR Training - Realistic Textures Edition
 
 Includes:
 - L1 Loss (pixel-wise reconstruction)
 - Perceptual Loss (VGG-based feature matching)
-- Combined Loss
+- SSIM Loss (structural similarity)
+- Edge Loss (gradient/sharpness preservation)
+- Frequency Loss (high-frequency detail preservation)
+- Combined Loss (all of the above)
 """
 
 import torch
@@ -220,31 +223,205 @@ class SSIMLoss(nn.Module):
             return ssim_map.mean(1).mean(1).mean(1)
 
 
+class EdgeLoss(nn.Module):
+    """
+    Edge/Gradient loss for preserving sharpness and details.
+    Compares gradients (edges) between prediction and target using Sobel filters.
+    This helps maintain sharp edges and fine details in the output.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        # Sobel filters for edge detection
+        self.sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3) / 4.0
+        
+        self.sobel_y = torch.tensor([
+            [-1, -2, -1],
+            [0, 0, 0],
+            [1, 2, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3) / 4.0
+        
+        # Register as buffers so they move to GPU with the model
+        self.register_buffer('sobel_x_buf', self.sobel_x)
+        self.register_buffer('sobel_y_buf', self.sobel_y)
+    
+    def get_gradients(self, img: torch.Tensor) -> torch.Tensor:
+        """Compute image gradients using Sobel filters"""
+        # Convert to grayscale for gradient computation
+        # Using luminance weights: 0.299*R + 0.587*G + 0.114*B
+        weights = torch.tensor([0.299, 0.587, 0.114], device=img.device).view(1, 3, 1, 1)
+        img_gray = (img * weights).sum(dim=1, keepdim=True)
+        
+        # Compute gradients
+        grad_x = F.conv2d(img_gray, self.sobel_x_buf.to(img.device), padding=1)
+        grad_y = F.conv2d(img_gray, self.sobel_y_buf.to(img.device), padding=1)
+        
+        # Gradient magnitude
+        gradient = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)
+        return gradient
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute edge loss
+        
+        Args:
+            pred: Predicted image [B, 3, H, W]
+            target: Target image [B, 3, H, W]
+        
+        Returns:
+            Edge loss value
+        """
+        pred_grad = self.get_gradients(pred)
+        target_grad = self.get_gradients(target)
+        return F.l1_loss(pred_grad, target_grad)
+
+
+class FrequencyLoss(nn.Module):
+    """
+    Frequency domain loss for preserving high-frequency details (textures).
+    Works in Fourier space to ensure fine details are preserved.
+    This is especially important for textures like fabric, foliage, and skin.
+    """
+    
+    def __init__(self, focus_on_high_freq: bool = True):
+        """
+        Args:
+            focus_on_high_freq: If True, weights high frequencies more heavily
+        """
+        super().__init__()
+        self.focus_on_high_freq = focus_on_high_freq
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute frequency loss
+        
+        Args:
+            pred: Predicted image [B, 3, H, W]
+            target: Target image [B, 3, H, W]
+        
+        Returns:
+            Frequency loss value
+        """
+        # FFT of both images
+        pred_fft = torch.fft.rfft2(pred, norm='ortho')
+        target_fft = torch.fft.rfft2(target, norm='ortho')
+        
+        # Compare amplitudes (magnitudes)
+        pred_mag = torch.abs(pred_fft)
+        target_mag = torch.abs(target_fft)
+        
+        if self.focus_on_high_freq:
+            # Create high-frequency emphasis mask
+            B, C, H, W = pred_mag.shape
+            # Distance from center (low frequencies) increases weight
+            y_coords = torch.linspace(0, 1, H, device=pred.device).view(1, 1, H, 1)
+            x_coords = torch.linspace(0, 1, W, device=pred.device).view(1, 1, 1, W)
+            # Higher weight for higher frequencies
+            freq_weight = torch.sqrt(y_coords ** 2 + x_coords ** 2).clamp(0.1, 1.0)
+            
+            loss = F.l1_loss(pred_mag * freq_weight, target_mag * freq_weight)
+        else:
+            loss = F.l1_loss(pred_mag, target_mag)
+        
+        return loss
+
+
+class LaplacianLoss(nn.Module):
+    """
+    Laplacian loss for multi-scale edge preservation.
+    Uses Laplacian pyramid to preserve edges at multiple scales.
+    """
+    
+    def __init__(self, num_levels: int = 3):
+        super().__init__()
+        self.num_levels = num_levels
+        
+        # Laplacian kernel
+        self.laplacian = torch.tensor([
+            [0, 1, 0],
+            [1, -4, 1],
+            [0, 1, 0]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+    
+    def get_laplacian(self, img: torch.Tensor) -> torch.Tensor:
+        """Apply Laplacian filter to image"""
+        B, C, H, W = img.shape
+        laplacian = self.laplacian.to(img.device)
+        
+        # Apply to each channel
+        channels = []
+        for c in range(C):
+            channel = img[:, c:c+1, :, :]
+            lap = F.conv2d(channel, laplacian, padding=1)
+            channels.append(lap)
+        
+        return torch.cat(channels, dim=1)
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute multi-scale Laplacian loss"""
+        total_loss = 0.0
+        
+        current_pred = pred
+        current_target = target
+        
+        for level in range(self.num_levels):
+            # Compute Laplacian at current scale
+            pred_lap = self.get_laplacian(current_pred)
+            target_lap = self.get_laplacian(current_target)
+            
+            # Weight decreases for coarser scales
+            weight = 1.0 / (2 ** level)
+            total_loss += weight * F.l1_loss(pred_lap, target_lap)
+            
+            # Downsample for next level
+            if level < self.num_levels - 1:
+                current_pred = F.avg_pool2d(current_pred, 2)
+                current_target = F.avg_pool2d(current_target, 2)
+        
+        return total_loss
+
+
 class CombinedLoss(nn.Module):
     """
-    Combined loss function for HDR training
-    Combines L1, Perceptual, and optionally SSIM losses
+    Combined loss function for HDR training - Realistic Textures Edition
+    
+    Combines multiple loss functions for high-quality HDR reconstruction:
+    - L1/Charbonnier: Pixel-wise reconstruction
+    - Perceptual: High-level texture matching via VGG features
+    - SSIM: Structural similarity preservation
+    - Edge: Gradient/sharpness preservation
+    - Frequency: High-frequency detail preservation
     """
     
     def __init__(
         self,
         l1_weight: float = 1.0,
-        perceptual_weight: float = 0.1,
-        ssim_weight: float = 0.0,
+        perceptual_weight: float = 0.2,
+        ssim_weight: float = 0.1,
+        edge_weight: float = 0.1,
+        frequency_weight: float = 0.05,
         use_charbonnier: bool = True
     ):
         """
         Args:
-            l1_weight: Weight for L1/Charbonnier loss
-            perceptual_weight: Weight for perceptual loss
-            ssim_weight: Weight for SSIM loss (0 to disable)
-            use_charbonnier: Use Charbonnier instead of L1
+            l1_weight: Weight for L1/Charbonnier loss (base reconstruction)
+            perceptual_weight: Weight for perceptual loss (textures)
+            ssim_weight: Weight for SSIM loss (structure)
+            edge_weight: Weight for edge loss (sharpness)
+            frequency_weight: Weight for frequency loss (fine details)
+            use_charbonnier: Use Charbonnier instead of L1 (more robust)
         """
         super().__init__()
         
         self.l1_weight = l1_weight
         self.perceptual_weight = perceptual_weight
         self.ssim_weight = ssim_weight
+        self.edge_weight = edge_weight
+        self.frequency_weight = frequency_weight
         
         # Initialize loss functions
         self.l1_loss = CharbonnierLoss() if use_charbonnier else L1Loss()
@@ -258,6 +435,30 @@ class CombinedLoss(nn.Module):
             self.ssim_loss = SSIMLoss()
         else:
             self.ssim_loss = None
+        
+        if edge_weight > 0:
+            self.edge_loss = EdgeLoss()
+        else:
+            self.edge_loss = None
+        
+        if frequency_weight > 0:
+            self.frequency_loss = FrequencyLoss(focus_on_high_freq=True)
+        else:
+            self.frequency_loss = None
+        
+        # Log active losses
+        active_losses = []
+        if l1_weight > 0:
+            active_losses.append(f"L1({l1_weight})")
+        if perceptual_weight > 0:
+            active_losses.append(f"Perceptual({perceptual_weight})")
+        if ssim_weight > 0:
+            active_losses.append(f"SSIM({ssim_weight})")
+        if edge_weight > 0:
+            active_losses.append(f"Edge({edge_weight})")
+        if frequency_weight > 0:
+            active_losses.append(f"Frequency({frequency_weight})")
+        print(f"[CombinedLoss] Active losses: {', '.join(active_losses)}")
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict:
         """
@@ -268,27 +469,39 @@ class CombinedLoss(nn.Module):
             target: Target image [B, 3, H, W]
         
         Returns:
-            Dictionary containing total loss and individual components
+            Tuple of (total_loss, dict of individual loss components)
         """
         losses = {}
         total_loss = 0.0
         
-        # L1 / Charbonnier loss
+        # L1 / Charbonnier loss - base reconstruction
         l1 = self.l1_loss(pred, target)
         losses['l1'] = l1.item()
         total_loss += self.l1_weight * l1
         
-        # Perceptual loss
+        # Perceptual loss - texture matching via VGG features
         if self.perceptual_loss is not None:
             perceptual = self.perceptual_loss(pred, target)
             losses['perceptual'] = perceptual.item()
             total_loss += self.perceptual_weight * perceptual
         
-        # SSIM loss
+        # SSIM loss - structural similarity
         if self.ssim_loss is not None:
             ssim = self.ssim_loss(pred, target)
             losses['ssim'] = ssim.item()
             total_loss += self.ssim_weight * ssim
+        
+        # Edge loss - gradient/sharpness preservation
+        if self.edge_loss is not None:
+            edge = self.edge_loss(pred, target)
+            losses['edge'] = edge.item()
+            total_loss += self.edge_weight * edge
+        
+        # Frequency loss - high-frequency detail preservation
+        if self.frequency_loss is not None:
+            freq = self.frequency_loss(pred, target)
+            losses['frequency'] = freq.item()
+            total_loss += self.frequency_weight * freq
         
         losses['total'] = total_loss.item()
         
@@ -319,12 +532,23 @@ if __name__ == "__main__":
     ssim = SSIMLoss()
     print(f"SSIM Loss: {ssim(pred, target).item():.6f}")
     
-    # Test combined loss
-    print("\n--- Combined Loss ---")
+    edge = EdgeLoss().to(device)
+    print(f"Edge Loss: {edge(pred, target).item():.6f}")
+    
+    freq = FrequencyLoss().to(device)
+    print(f"Frequency Loss: {freq(pred, target).item():.6f}")
+    
+    laplacian = LaplacianLoss().to(device)
+    print(f"Laplacian Loss: {laplacian(pred, target).item():.6f}")
+    
+    # Test combined loss with realistic textures configuration
+    print("\n--- Combined Loss (Realistic Textures) ---")
     combined = CombinedLoss(
         l1_weight=1.0,
-        perceptual_weight=0.1,
-        ssim_weight=0.1
+        perceptual_weight=0.2,
+        ssim_weight=0.1,
+        edge_weight=0.1,
+        frequency_weight=0.05
     ).to(device)
     
     total, components = combined(pred, target)

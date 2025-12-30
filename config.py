@@ -38,10 +38,13 @@ class TrainingConfig:
     test_epochs: int = 10
     test_batch_size: int = 4
     
-    # Loss weights (L1 only - most stable)
-    l1_weight: float = 1.0
-    perceptual_weight: float = 0.0  # Disabled - causes instability
-    ssim_weight: float = 0.0  # Disabled
+    # Loss weights - Realistic Textures Configuration
+    # Optimized for natural-looking HDR with good texture preservation
+    l1_weight: float = 1.0           # Base reconstruction loss
+    perceptual_weight: float = 0.2   # High - for realistic textures (VGG features)
+    ssim_weight: float = 0.1         # Structure preservation
+    edge_weight: float = 0.1         # Edge/gradient preservation for sharpness
+    frequency_weight: float = 0.05   # High-frequency detail preservation
     
     # Optimizer settings
     beta1: float = 0.9
